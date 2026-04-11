@@ -1,0 +1,17 @@
+[project]
+name = "multimodal-rag-system1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+   "fastapi>=0.135.2",
+   "uvicorn>=0.42.0",
+   "python-dotenv>=1.2.2",
+   "langchain-postgres>=0.0.17",
+   "langchain-google-genai>=4.2.1",
+   "langgraph>=1.1.6",
+   "langchain>=1.2.15",
+   "python-multipart>=0.0.24",
+   "docling>=2.85.0",
+]
