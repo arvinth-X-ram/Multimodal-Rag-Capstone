@@ -1,6 +1,12 @@
 import base64
 import io
 import os
+from google.genai import types
+# import google.generativeai as genai
+import google.genai as genai
+# vlm_model = genai.GenerativeModel("models/gemini-1.5-pro")
+# client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -73,6 +79,10 @@ def parse_document(file_path: str) -> list[dict]:
     # iterate_items() yields (level, node) tuples in Docling >= 2.x.
     # level is the heading depth (1 = top-level); node is the DocItem.
     for item in doc.iterate_items():
+        # if isinstance(item, tuple):
+        #     node = item[1]
+        # else:
+        #     node = item
         if isinstance(item, tuple):
             node,_ = item  # unpack yields (level, node); discard level
         else:
@@ -195,42 +205,178 @@ def parse_document(file_path: str) -> list[dict]:
         #   2. .image.pil_image — fallback attribute on some Docling versions
         # The PIL Image is encoded as a base64 PNG and stored in metadata so
         # the Gemini Vision LLM can receive it directly during generation.
+
+
         elif "picture" in label or "figure" in label or label == "chart":
+            print("DOC FOUND REAL IMAGE NODE:", label)
             img_b64 = None
-            # .text on a PictureItem is the inline caption, if any
-            caption = getattr(node, "text", "") or ""
+            caption_from_pdf = getattr(node, "text", "").strip()
 
             try:
+                # Extract image from Docling
+                pil_img = None
                 if hasattr(node, "get_image"):
                     pil_img = node.get_image(doc)
-                    if pil_img:
-                        buf = io.BytesIO()
-                        pil_img.save(buf, format="PNG")
-                        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-                # Fallback path for older Docling versions
-                if img_b64 is None and hasattr(node, "image") and node.image:
+                if pil_img is None and hasattr(node, "image") and node.image:
                     pil_img = getattr(node.image, "pil_image", None)
-                    if pil_img:
-                        buf = io.BytesIO()
-                        pil_img.save(buf, format="PNG")
-                        img_b64 = base64.b64encode(buf.getvalue()).decode()
-            except Exception:
-                # Image extraction is best-effort; a missing image is not
-                # fatal — the caption / placeholder text is still indexed.
-                pass
 
-            # Use the caption as the searchable text for this image chunk.
-            # If no caption exists, store a location placeholder so the chunk
-            # is not completely empty (PGVector requires non-empty content).
-            content = caption.strip() or f"[Image on page {page_no}]"
-            parsed_chunks.append(
-                {
-                    "content": content,
-                    "content_type": "image",
-                    "metadata": _make_metadata("image", "picture", img_b64),
-                }
-            )
+                # Convert to base64 if image found
+                if pil_img:
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG")
+                    img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+            except Exception as e:
+                print("[Image Extract Error]", e)
+                pil_img = None
+
+
+            # --- VLM Captioning (Gemini Vision) ---
+
+
+            ai_caption = None
+
+            if img_b64:
+                try:
+                    img_bytes = base64.b64decode(img_b64)
+
+                    response = client.models.generate_content(
+                        model="gemini-3.1-flash-lite-preview",
+                        contents=[
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(
+                                        inline_data=types.Blob(
+                                            mime_type="image/png",
+                                            data=img_bytes
+                                        )
+                                    ),
+                                    types.Part(
+                                        text="Describe this image in one clear factual sentence."
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+
+                    if response and response.candidates:
+                        ai_caption = response.candidates[0].content.parts[0].text.strip()
+
+                except Exception as e:
+                    print("[VLM Error]", e)
+
+
+
+
+
+
+
+
+
+            # ai_caption = None
+            # if img_b64:
+            #     try:
+            #         img_bytes = base64.b64decode(img_b64)
+
+
+
+            #         if hasattr(result, "text") and result.text:
+            #             ai_caption = result.text.strip()
+
+            #     except Exception as e:
+            #         print("[VLM Error]", e)
+
+
+
+
+            # if img_b64:
+            #     try:
+            #         img_bytes = base64.b64decode(img_b64)
+            #         result = vlm_model.generate_content(
+            #             ["Describe this image in one clear sentence.", img_bytes]
+            #         )
+            #         ai_caption = result.text.strip() if result.text else None
+            #     except Exception as e:
+            #         print("[VLM Error]", e)
+
+            # Prioritize captions
+            final_caption = caption_from_pdf or ai_caption or f"[Image on page {page_no}]"
+
+            parsed_chunks.append({
+                "content": final_caption,
+                "content_type": "image",
+                "metadata": _make_metadata("image", "picture", img_b64),
+            })
+
+        
+
+
+
+
+
+
+
+       
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # elif "picture" in label or "figure" in label or label == "chart":
+        #     img_b64 = None
+        #     # .text on a PictureItem is the inline caption, if any
+        #     caption = getattr(node, "text", "") or ""
+
+        #     try:
+        #         if hasattr(node, "get_image"):
+        #             pil_img = node.get_image(doc)
+        #             if pil_img:
+        #                 buf = io.BytesIO()
+        #                 pil_img.save(buf, format="PNG")
+        #                 img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        #         # Fallback path for older Docling versions
+        #         if img_b64 is None and hasattr(node, "image") and node.image:
+        #             pil_img = getattr(node.image, "pil_image", None)
+        #             if pil_img:
+        #                 buf = io.BytesIO()
+        #                 pil_img.save(buf, format="PNG")
+        #                 img_b64 = base64.b64encode(buf.getvalue()).decode()
+        #     except Exception:
+        #         # Image extraction is best-effort; a missing image is not
+        #         # fatal — the caption / placeholder text is still indexed.
+        #         pass
+
+        #     # Use the caption as the searchable text for this image chunk.
+        #     # If no caption exists, store a location placeholder so the chunk
+        #     # is not completely empty (PGVector requires non-empty content).
+        #     content = caption.strip() or f"[Image on page {page_no}]"
+        #     parsed_chunks.append(
+        #         {
+        #             "content": content,
+        #             "content_type": "image",
+        #             "metadata": _make_metadata("image", "picture", img_b64),
+        #         }
+        #     )
+
+
+
+
+
+
+
+
 
         # ── Plain text: paragraphs, list items, captions, footnotes, etc. ─────
         # Everything that is not a heading, table, or image falls here.
