@@ -127,4 +127,8 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"PDF not found at: {pdf_path.resolve()}")
 
     result = run_ingestion(str(pdf_path))
+<<<<<<< HEAD
     print(f"\nIngestion complete: {result}")
+=======
+    print(f"\nIngestion complete: {result}")
+>>>>>>> raghul

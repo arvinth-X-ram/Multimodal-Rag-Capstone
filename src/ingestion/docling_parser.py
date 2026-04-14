@@ -392,4 +392,8 @@ def parse_document(file_path: str) -> list[dict]:
                     }
                 )
 
+<<<<<<< HEAD
     return parsed_chunks
+=======
+    return parsed_chunks
+>>>>>>> raghul

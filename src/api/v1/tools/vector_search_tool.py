@@ -24,8 +24,11 @@ def vector_search(query: str, k: int = 5, chunk_type: str | None = None) -> list
     # 2. Ensure each chunk has a consistent structure for the RRF map
     formatted_chunks = []
     for chunk in chunks:
+<<<<<<< HEAD
         # We preserve all original fields (content, image_base64, metadata)
         # but ensure 'content' is easily accessible for the RRF key mapping
+=======
+>>>>>>> raghul
         formatted_chunks.append({
             "content": chunk.get("content", ""),
             "chunk_type": chunk.get("chunk_type"),
@@ -36,7 +39,11 @@ def vector_search(query: str, k: int = 5, chunk_type: str | None = None) -> list
                 "element_type": chunk.get("element_type"),
                 "similarity": round(chunk.get("similarity", 0), 4)
             },
+<<<<<<< HEAD
             "image_base64": chunk.get("image_base64"), # Preserved for the final LLM formatting
+=======
+            "image_path": chunk.get("image_path"),   # local filesystem path (None for text/table)
+>>>>>>> raghul
             "page_number": chunk.get("page_number")
         })
 

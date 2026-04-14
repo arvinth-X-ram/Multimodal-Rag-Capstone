@@ -8,4 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+<<<<<<< HEAD
 .env
+=======
+>>>>>>> raghul

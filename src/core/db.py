@@ -1,3 +1,11 @@
+<<<<<<< HEAD
+=======
+import os
+from dotenv import load_dotenv
+from langchain_postgres import PGVector
+from google import genai
+from google.genai.types import EmbedContentConfig
+>>>>>>> raghul
 import base64
 import hashlib
 import json
@@ -9,6 +17,7 @@ from dotenv import load_dotenv
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+<<<<<<< HEAD
 
 load_dotenv()
 
@@ -42,6 +51,70 @@ _embeddings_model = GoogleGenerativeAIEmbeddings(
 # of opening a new one per request. Created on first use to avoid failing at
 # import time when the DB is not yet available (e.g. during tests).
 # ---------------------------------------------------------------------------
+=======
+_EMBED_BATCH_SIZE = 50
+
+
+load_dotenv(override=True)
+
+PG_CONNECTION = os.getenv("PG_CONNECTION_STRING")
+if not PG_CONNECTION:
+    raise ValueError("PG_CONNECTION_STRING is not set")
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY is not set")
+
+_PG_CONNECTION = os.getenv("PG_CONNECTION_STRING", "")
+_PG_DSN = _PG_CONNECTION.replace("postgresql+psycopg://", "postgresql://")
+
+
+class Gemini1536Embeddings:
+    """Forces exactly 1536 dimensions using official Google GenAI SDK"""
+    
+    def __init__(self):
+        self.client = genai.Client(api_key=GOOGLE_API_KEY)
+        self.model = "gemini-embedding-2-preview"
+        self.dim = 1536
+
+    def embed_query(self, text: str) -> list[float]:
+        result = self.client.models.embed_content(
+            model=self.model,
+            contents=text,
+            config=EmbedContentConfig(
+                output_dimensionality=self.dim,
+                task_type="RETRIEVAL_QUERY"
+            )
+        )
+        return result.embeddings[0].values
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        result = self.client.models.embed_content(
+            model=self.model,
+            contents=texts,   # batch support
+            config=EmbedContentConfig(
+                output_dimensionality=self.dim,
+                task_type="RETRIEVAL_DOCUMENT"
+            )
+        )
+        return [embedding.values for embedding in result.embeddings]
+
+
+def get_embedding_model():
+    return Gemini1536Embeddings()
+
+embeddings_model=get_embedding_model()
+
+
+def get_vector_store(collection_name: str = "policy_docs"):
+    return PGVector(
+        collection_name=collection_name,
+        connection=PG_CONNECTION,
+        embeddings=get_embedding_model(),
+        use_jsonb=True,
+    )
+
+>>>>>>> raghul
 _pool: ConnectionPool | None = None
 
 
@@ -138,7 +211,11 @@ def store_chunks(chunks: list[dict], doc_id: str) -> int:
     all_embeddings: list[list[float]] = []
     for i in range(0, len(contents), _EMBED_BATCH_SIZE):
         batch = contents[i : i + _EMBED_BATCH_SIZE]
+<<<<<<< HEAD
         all_embeddings.extend(_embeddings_model.embed_documents(batch))  # Issue 8
+=======
+        all_embeddings.extend(embeddings_model.embed_documents(batch))  # Issue 8
+>>>>>>> raghul
 
     # ── Insert rows ───────────────────────────────────────────────────────────
     # Issue 10 fix: Only store fields in JSONB that don't already have a
@@ -241,7 +318,11 @@ def similarity_search(
     The <=> operator is pgvector's cosine distance operator.
     Similarity = 1 − cosine_distance, so 1.0 = identical, 0.0 = orthogonal.
     """
+<<<<<<< HEAD
     query_vec = _embeddings_model.embed_query(query)  # Issue 8: use singleton
+=======
+    query_vec = embeddings_model.embed_query(query)  # Issue 8: use singleton
+>>>>>>> raghul
     embedding_str = "[" + ",".join(str(v) for v in query_vec) + "]"
 
     # Conditionally add a chunk_type filter without SQL injection risk
@@ -265,6 +346,7 @@ def similarity_search(
             cur.execute(sql, {"vec": embedding_str, "chunk_type": chunk_type, "k": k})
             rows = cur.fetchall()
 
+<<<<<<< HEAD
     # Read image from filesystem and re-encode as base64 for callers.
     results = []
     for row in rows:
@@ -276,6 +358,12 @@ def similarity_search(
             ).decode()
         else:
             row["image_base64"] = None
+=======
+    # Return image_path as-is; callers open the file from disk if needed.
+    results = []
+    for row in rows:
+        row = dict(row)
+>>>>>>> raghul
         results.append(row)
 
     return results
@@ -318,6 +406,7 @@ def get_all_chunks(chunk_type: str | None = None, limit: int = 200) -> list[dict
     results = []
     for row in rows:
         row = dict(row)
+<<<<<<< HEAD
         img_path = row.pop("image_path", None)
         if img_path and os.path.exists(img_path):
             row["image_base64"] = base64.b64encode(
@@ -325,6 +414,8 @@ def get_all_chunks(chunk_type: str | None = None, limit: int = 200) -> list[dict
             ).decode()
         else:
             row["image_base64"] = None
+=======
+>>>>>>> raghul
         results.append(row)
 
     return results
