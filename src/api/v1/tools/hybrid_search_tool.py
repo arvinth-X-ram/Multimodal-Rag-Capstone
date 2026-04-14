@@ -3,7 +3,7 @@ from src.api.v1.tools.fts_search_tool import fts_search
 from src.api.v1.tools.vector_search_tool import vector_search
 from langchain_core.tools import tool
 
-def _hybrid_search(query: str, k: int = 5) -> list[dict]:
+def hybrid_search(query: str, k: int = 5) -> list[dict]:
 #    vector_store = get_vector_store()
    vector_docs = vector_search(query, k=k)
    fts_docs    = fts_search(query, k=k)

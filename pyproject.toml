@@ -14,4 +14,6 @@ dependencies = [
    "langchain>=1.2.15",
    "python-multipart>=0.0.24",
    "docling>=2.85.0",
+   "cohere>=6.1.0",
+   "langchain-community>=0.4.1",
 ]
