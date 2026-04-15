@@ -1,17 +1,22 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Dict, Any, Optional
 
-# ---- Request ----
+
 class QueryRequest(BaseModel):
-    query: str = Field(..., description="User query")
-   #  k: int = Field(5, ge=1, le=20, description="Number of chunks to retrieve")
-   #  chunk_type: Optional[str] = Field(
-   #      None, description="Filter by content type: 'text', 'table', or 'image'"
-   #  )
+   query: str = Field(..., example="What is the minimum CIBIL score for personal loans?")
+
 
 class QueryResponse(BaseModel):
-    answer: str
-    sources: List[dict]
+   query: str
+   answer: str
+   policy_citations: str
+   page_no: str
+   document_name: str
+   image_path: Optional[str] = Field(
+       default=None,
+       description="Local filesystem path to the image file when the answer involves a visual chunk (chart/figure). None for text-only answers.",
+   )
+
 
 class AIResponse(BaseModel):
    query: str = Field(description="The Given query by user must be present here")
@@ -19,5 +24,7 @@ class AIResponse(BaseModel):
    policy_citations: str = Field(description="Give the Policy Citation")
    page_no: str = Field(description="The page number in the metadata")
    document_name: str = Field(description="Name of the document used")
-
-
+   image_path: Optional[str] = Field(
+       default=None,
+       description="Local filesystem path to the image. Leave null — the pipeline injects this field automatically after generation.",
+   )
