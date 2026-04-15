@@ -19,5 +19,8 @@ class AIResponse(BaseModel):
    policy_citations: str = Field(description="Give the Policy Citation")
    page_no: str = Field(description="The page number in the metadata")
    document_name: str = Field(description="Name of the document used")
-
+   image_path: Optional[str] = Field(
+       default=None,
+       description="Local filesystem path to the image. Leave null — the pipeline injects this field automatically after generation.",
+   )
 

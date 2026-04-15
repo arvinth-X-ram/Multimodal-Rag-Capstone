@@ -342,6 +342,6 @@ def get_sql_database() -> SQLDatabase:
         raise ValueError("AGENTIC_RAG_DB_URL is not set. Check your .env file.")
     return SQLDatabase.from_uri(
         db_url,
-        include_tables=["products", "categories", "orders", "order_items"],
+        include_tables=["customers", "credit_cards", "card_transactions", "reward_transactions","billing_statements"],
         sample_rows_in_table_info=2,
     )

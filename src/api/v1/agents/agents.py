@@ -1,5 +1,6 @@
 import os
-from typing import Literal, TypedDict, List, Annotated
+import operator
+from typing import Literal, TypedDict, List, Annotated, Optional
 from pydantic import BaseModel, Field
 
 import cohere
@@ -8,7 +9,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
-from langchain_core.runnables.graph import MermaidDrawMethod
 
 from src.api.v1.schema.query_schema import AIResponse
 from src.api.v1.tools.vector_search_tool import vector_search
@@ -16,33 +16,38 @@ from src.api.v1.tools.fts_search_tool import fts_search
 from src.api.v1.tools.hybrid_search_tool import hybrid_search
 from src.core.db import get_sql_database
 
-os.environ["PYPPETEER_CHROMIUM_REVISION"] = "1263111"
-
 load_dotenv(override=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# State 
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# State
-# Each chunk in the lists is a plain dict:
-#   { content, chunk_type, metadata, image_base64, page_number }
-# ─────────────────────────────────────────────────────────────────────────────
+def merge_dicts(existing: dict, new: dict) -> dict:
+    return {**existing, **new}
+
+def _extract_text(content) -> str:
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        return "".join([p.get("text", "") if isinstance(p, dict) else str(p) for p in content])
+    return str(content)
 
 class RAGState(TypedDict):
-    query: str
-    retrieved_docs: list[dict]
-    reranked_docs: list[dict]
-    response: dict
-    is_valid: bool
-    attempts: int
-    route: str  # "product" or "document" — set by router_node
-    # sql_response: dict  # holds the structured response from the nl2sql_node (answer + metadata)
-    hallucination_attempts: int  # tracks how many times we've regenerated due to hallucination
-    hallucination_grounded: bool  # True = grounded (no hallucination), False = hallucinating
+    query: Annotated[str, lambda x, y: y] 
+    retrieved_docs: Annotated[list[dict], operator.add] 
+    reranked_docs: Annotated[list[dict], lambda x, y: y]
+    sql_raw_response: Annotated[Optional[dict], lambda x, y: y]
+    doc_raw_response: Annotated[Optional[dict], lambda x, y: y]
+    response: Annotated[dict, merge_dicts]
+    paths_completed: Annotated[list[str], operator.add] 
+    routes: Annotated[List[str], lambda x, y: y]
+    is_valid: Annotated[bool, lambda x, y: y]
+    attempts: Annotated[int, operator.add]
+    hallucination_attempts: Annotated[int, operator.add]
+    hallucination_grounded: Annotated[bool, lambda x, y: y]
 
 class _RouteDecision(BaseModel):
-    route: Literal["product", "document"]
+    routes: List[Literal["credit_card_db", "document"]]
     reason: str
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LangChain @tool wrappers (used only so the LLM can bind & choose them)
@@ -65,169 +70,75 @@ def hybrid_search_tool(query: Annotated[str, "User query"]) -> list[dict]:
     """Hybrid search (vector + FTS via RRF) — best default for most questions."""
     return hybrid_search(query, k=5)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _extract_text(content) -> str:
-    """
-    Safely extract a plain string from whatever shape the LLM returns.
-    Gemini may return a list of content parts like:
-      [{'type': 'text', 'text': 'yes', ...}]
-    This helper handles that, plain strings, and single-dict cases.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                parts.append(item.get("text", ""))
-            else:
-                parts.append(str(item))
-        return "".join(parts)
-    if isinstance(content, dict):
-        return content.get("text", str(content))
-    return str(content)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Nodes
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_llm(temperature: float = 0.0) -> ChatGoogleGenerativeAI:
+def _build_llm(temperature: float = 0.0):
     return ChatGoogleGenerativeAI(
-        model=os.getenv("GOOGLE_LLM_MODEL", "gemini-3.1-pro-preview"),
+        model=os.getenv("GOOGLE_LLM_MODEL", "gemini-1.5-pro"),
         google_api_key=os.getenv("GOOGLE_API_KEY"),
         temperature=temperature,
     )
 
-def nlsql_router_node(state: RAGState) -> RAGState:
+def router_node(state: RAGState) -> dict:
     llm = _build_llm()
     structured_llm = llm.with_structured_output(_RouteDecision)
-
     prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            """You are a query router for an agentic RAG system.
-            Classify the user's query into EXACTLY one of two routes:
+        ("system",""" **Role**: You are a routing specialist for the NorthStar Bank Credit Card Spend Summarizer system. Your task is to analyze the user's query and determine the appropriate data source(s) required to answer it.
 
-            "product"  — the query asks about products, product prices, stock/inventory,
-                        product categories, customer orders, order items, or anything
-                        answerable from a structured e-commerce database with tables:
-                        products, categories, orders, order_items.
+**Path Definitions**:
+1. **'credit_card_db'**: Choose this path if the query requires specific data from the database tables provided (Customers, Credit Cards, Transactions, Reward Transactions, or Billing Statements). This includes requests for spend summaries, balance checks, transaction history, or specific customer account details.
+2. **'document'**: Choose this path if the query asks for general information, policies, or explanations regarding NorthStar Bank credit card features, spend analysis logic, billing cycle rules, reward program terms, credit limit policies, or customer communication standards.
 
-            "document" — the query asks about policies, procedures, guidelines,
-                        regulations, or any topic that requires reading text documents.
+**Decision Rules**:
+- If the query references specific account IDs (e.g., 'CC-881001'), transaction dates, or requests a calculation of spend, output ONLY: **credit_card_db**
+- If the query asks about general bank procedures (e.g., "How is the minimum due calculated?" or "What are the benefits of the Gold variant?"), output ONLY: **document**
+- If the query requires both specific data AND an explanation of a policy (e.g., "Show my March transactions and explain how my rewards were calculated"), output BOTH: **credit_card_db, document**
 
-            Reply with the route and a one-sentence reason."""
-        ),
-        ("human", "Query: {query}")
+**Constraint**: Your output must contain ONLY the label(s) 'credit_card_db', 'document', or both. Do not provide conversational text."""),
+        ("human", "{query}")
     ])
+    decision = (prompt | structured_llm).invoke({"query": state["query"]})
+    print(f"[router] Routes: {decision.routes}")
+    return {"routes": decision.routes, "paths_completed": []}
 
-    chain = prompt | structured_llm
-    decision = chain.invoke({"query": state["query"]})
-    print(f"[router_node] Route → '{decision.route}' | Reason: {decision.reason}")
-    return {**state, "route": decision.route}
-
-def nl2sql_node(state: RAGState) -> RAGState:
+def nl2sql_node(state: RAGState) -> dict:
     llm = _build_llm()
     db = get_sql_database()
-
-    # ── Step 1: Generate SQL using Gemini + live schema ─────────────────────
     schema_info = db.get_table_info()
 
     sql_prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            """You are a PostgreSQL expert. Given the database schema below, 
-            write a single valid SELECT query that answers the user's question.
-
-            Rules:
-            - Return ONLY the raw SQL — no explanation, no markdown fences, no backticks.
-            - Use only the tables and columns present in the schema.
-            - Do NOT generate INSERT, UPDATE, DELETE, DROP, or any DML/DDL statements.
-            - Always add a LIMIT clause (max 50 rows) unless the question asks for aggregates.
-            - For product or text searches: NEVER search for the full multi-word phrase as one
-            ILIKE pattern. Instead, split the search into individual meaningful keywords
-            and OR them together across both name and description columns.
-            Example — user asks "wireless headset":
-                WHERE (name ILIKE '%wireless%' OR description ILIKE '%wireless%')
-                OR (name ILIKE '%headset%'  OR description ILIKE '%headset%')
-                OR (name ILIKE '%headphones%' OR description ILIKE '%headphones%')
-            Use your knowledge of synonyms (headset/headphones, laptop/notebook, etc.)
-            to cast a wider net when the exact term may not match.
-
-            Database schema:
-            {schema}"""
-        ),
+        ("system", "You are a PostgreSQL expert. Return ONLY raw SQL based on schema: {schema}"),
         ("human", "Question: {question}")
     ])
 
-    sql_chain = sql_prompt | llm
-    raw_sql = sql_chain.invoke({
-        "schema": schema_info,
-        "question": state["query"]
-    })
-    # Gemini may return content as a list of parts or a plain string
-    content = raw_sql.content
-    if isinstance(content, list):
-        content = "".join(
-            p.get("text", "") if isinstance(p, dict) else str(p)
-            for p in content
-        )
-    generated_sql = content.strip().strip("```").strip()
-    if generated_sql.lower().startswith("sql"):
-        generated_sql = generated_sql[3:].strip()
-    print(f"[nl2sql_node] Generated SQL:\n{generated_sql}")
+    raw_sql = (sql_prompt | llm).invoke({"schema": schema_info, "question": state["query"]})
+    content = _extract_text(raw_sql.content)
+    generated_sql = content.strip().strip("```").replace("sql", "").strip()
 
-    # ── Step 2: Execute SQL ──────────────────────────────────────────────────
     try:
-        sql_result: str = db.run(generated_sql)
+        sql_result = db.run(generated_sql)
     except Exception as exc:
-        sql_result = f"SQL execution error: {exc}"
-    print(f"[nl2sql_node] Raw result (truncated): {str(sql_result)[:200]}")
+        sql_result = f"Error: {exc}"
 
-    # ── Step 3: Summarise into AIResponse ────────────────────────────────────
     structured_llm = llm.with_structured_output(AIResponse)
     answer_prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            "You are a helpful data analyst. Answer the user's question using "
-            "the SQL query results below. Be concise and format numbers/lists clearly. "
-            "Set policy_citations to empty string, "
-            "page_no to 'N/A', and document_name to 'agentic_rag_db'."
-        ),
-        (
-            "human",
-            "Question: {query}\n\n"
-            "SQL Used:\n{sql}\n\n"
-            "Query Results:\n{result}"
-        )
+        ("system", "Answer concisely using SQL results."),
+        ("human", "Query: {query}\nSQL: {sql}\nResults: {result}")
     ])
 
-    chain = answer_prompt | structured_llm
-    answer = chain.invoke({
-        "query": state["query"],
-        "sql": generated_sql,
-        "result": sql_result
+    answer = (answer_prompt | structured_llm).invoke({
+        "query": state["query"], "sql": generated_sql, "result": sql_result
     })
-    print("[nl2sql_node] Answer generated.")
-    response = answer.model_dump()
-    # response["policy_citations"] = "N/A"
-    # response["sql_query_executed"] = generated_sql
+    
+    print("[nl2sql] Finished path")
     return {
-        **state,
-        # "generated_sql": generated_sql,
-        # "sql_result": str(sql_result),
-        "response": response
+        "sql_raw_response": {"answer": answer.answer, "document_name": "agentic_rag_db"}, 
+        "paths_completed": ["credit_card_db"]
     }
 
-
-def agent_node(state: RAGState) -> RAGState:
+def agent_node(state: RAGState) -> dict:
     """LLM picks which search tool to call, then executes it."""
     llm = _build_llm(temperature=0.0)
     # tools = [vector_search_tool, fts_search_tool, hybrid_search_tool]
@@ -267,86 +178,39 @@ def agent_node(state: RAGState) -> RAGState:
         print("[agent] No tool called → fallback to hybrid_search")
         docs = hybrid_search(state["query"], k=10)
 
-    print(f"[agent] Retrieved {docs}")
+    # print(f"[agent] Retrieved {docs}")
     return {**state, "retrieved_docs": docs}
 
-
-def rerank_node(state: RAGState) -> RAGState:
-    """Cohere reranker over the retrieved chunks."""
+def rerank_node(state: RAGState) -> dict:
     docs = state["retrieved_docs"]
-    if not docs:
-        return {**state, "reranked_docs": []}
-
+    if not docs: return {"reranked_docs": []}
     co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
+    res = co.rerank(model="rerank-english-v3.0", query=state["query"], documents=[d["content"] for d in docs], top_n=5)
+    return {"reranked_docs": [docs[r.index] for r in res.results]}
 
-    # Cohere expects plain strings; use the content field
-    rerank_response = co.rerank(
-        model="rerank-english-v3.0",
-        query=state["query"],
-        documents=[doc["content"] for doc in docs],
-        top_n=5,
-    )
-
-    reranked_docs = [docs[r.index] for r in rerank_response.results]
-    print(f"[rerank] Top {len(reranked_docs)} chunks after reranking")
-    return {**state, "reranked_docs": reranked_docs}
-
-
-def validate_node(state: RAGState) -> RAGState:
-    """Ask the LLM whether the retrieved chunks are sufficient."""
+def validate_node(state: RAGState) -> dict:
     llm = _build_llm(temperature=0.0)
-
-    context_preview = "\n\n".join(
-        f"Chunk {i+1}: {doc['content'][:280]}..."
-        for i, doc in enumerate(state["reranked_docs"])
-    )
-
-    prompt = (
-        f'User query: "{state["query"]}"\n\n'
-        f"Retrieved & reranked chunks:\n{context_preview}\n\n"
-        "Are these chunks sufficient to answer the query completely?\n"
-        "Reply with ONLY one word: yes or no"
-    )
-
+    context_preview = "\n\n".join([f"Chunk {i+1}: {doc['content'][:280]}..." for i, doc in enumerate(state["reranked_docs"])])
+    prompt = (f"Query: {state['query']}\n\nContext:\n{context_preview}\n\n"
+              "Is this sufficient to answer? And please note that the query may contain queries related to both documents and credit_card_dbs.Make sure the generated answer is relevant to the document part of the query, Even One chunck of data is enough. Reply ONLY 'yes' or 'no'.")
+    
     response = llm.invoke(prompt)
     is_valid = _extract_text(response.content).strip().lower().startswith("yes")
+    print(f"[validate] Sufficient: {is_valid}")
+    return {"is_valid": is_valid, "attempts": 1}
 
-    print(f"[validate] Chunks are {'SUFFICIENT ✓' if is_valid else 'INSUFFICIENT ✗'}")
-    return {**state, "is_valid": is_valid, "attempts": state.get("attempts", 0) + 1}
-
-
-def rewrite_query_node(state: RAGState) -> RAGState:
-    """Rewrite the query to improve retrieval on the next attempt."""
+def rewrite_query_node(state: RAGState) -> dict:
     llm = _build_llm(temperature=0.3)
-
-    prompt = ChatPromptTemplate.from_template(
-        "Rewrite the query to be clearer, more specific and better for search.\n"
-        "Original: {query}\n\n"
-        "Rewritten query (only the question, no explanation):"
-    )
-
-    result = (prompt | llm).invoke({"query": state["query"]})
+    prompt = f"Rewrite this query for better search retrieval: {state['query']}"
+    result = llm.invoke(prompt)
     new_query = _extract_text(result.content).strip()
+    print(f"[rewrite] Old: {state['query']} -> New: {new_query}")
+    return {"query": new_query, "retrieved_docs": [], "reranked_docs": []}
 
-    print(f"[rewrite] Old → {state['query']}")
-    print(f"[rewrite] New → {new_query}")
-
-    return {
-        **state,
-        "query": new_query,
-        "retrieved_docs": [],
-        "reranked_docs": [],
-        "is_valid": False,
-    }
-
-
-def generate_answer_node(state: RAGState) -> RAGState:
-    """Generate a structured answer from the reranked chunks."""
-    llm = _build_llm(temperature=0.0)
+def generate_answer_node(state: RAGState) -> dict:
+    llm = _build_llm()
     structured_llm = llm.with_structured_output(AIResponse)
 
-    # Collect the first image chunk's path (if any) — stored on the local filesystem.
-    # We inject the path rather than the bytes so the response stays lightweight.
     first_image_path: str | None = None
     for doc in state["reranked_docs"]:
         if doc.get("chunk_type") == "image" and doc.get("image_path"):
@@ -368,93 +232,54 @@ def generate_answer_node(state: RAGState) -> RAGState:
     context = "\n\n".join(context_parts)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Answer ONLY using the provided context. Always cite source, page number and section."),
+        ("system", "Answer ONLY using provided context. Cite sources."),
         ("human", "Context:\n{context}\n\nQuestion: {query}"),
     ])
 
     result = (prompt | structured_llm).invoke({"context": context, "query": state["query"]})
-    
-    # Inject the image path directly — never echo file bytes through the LLM
-    response_dict = result.model_dump()
-    response_dict["image_path"] = first_image_path
-    # Keep image_base64 absent/None so the schema stays consistent
-    response_dict.pop("image_base64", None)
-    
-    print("[generate_answer] Final answer generated")
-    return {**state, "response": response_dict}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Hallucination Evaluator — replicates LangSmith langchain-ai/hallucination-eval
-# ─────────────────────────────────────────────────────────────────────────────
-
-class HallucinationGrade(BaseModel):
-    """Structured output schema for the hallucination grader LLM judge."""
-    score: str = Field(
-        description="Binary 'yes' or 'no'. 'yes' means the answer is grounded in the facts; 'no' means it hallucinated."
-    )
-
-
-def hallucination_node(state: RAGState) -> RAGState:
-    """
-    LLM-as-a-Judge hallucination evaluator.
-
-    Replicates the LangSmith `langchain-ai/hallucination-eval` prompt:
-      - System: You are a grader assessing whether an LLM generation is grounded
-                in / supported by a set of retrieved facts.
-                Give a binary score 'yes' or 'no'. 'yes' means the answer IS
-                grounded in / supported by the set of facts.
-      - Human:  Set of facts: <documents>\nLLM generation: <generation>
-
-    score='yes'  → answer is grounded,  proceed to END.
-    score='no'   → hallucination detected, loop back to generate_answer.
-    """
-    llm = _build_llm(temperature=0.0)
-    structured_llm = llm.with_structured_output(HallucinationGrade)
-
-    # Build the flat fact context from reranked docs (same documents used for generation)
-    documents = "\n\n".join(
-        f"Fact {i+1}: {doc['content']}"
-        for i, doc in enumerate(state["reranked_docs"])
-    )
-    generation = state["response"].get("answer", "")
-
-    # ── Exact LangSmith hallucination-eval prompt ──────────────────────────────
-    system_prompt = (
-        "You are a grader assessing whether an LLM generation is grounded in "
-        "/ supported by a set of retrieved facts. \n"
-        "Give a binary score 'yes' or 'no'. 'yes' means that the answer is "
-        "grounded in / supported by the set of facts."
-    )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "Set of facts: \n\n {documents} \n\n LLM generation: {generation}"),
-    ])
-    # ──────────────────────────────────────────────────────────────────────────
-
-    result: HallucinationGrade = (prompt | structured_llm).invoke(
-        {"documents": documents, "generation": generation}
-    )
-
-    score = result.score.strip().lower()
-    is_grounded = score.startswith("yes")
-    current_attempts = state.get("hallucination_attempts", 0) + 1
-
-    if is_grounded:
-        print(f"[hallucination_check] ✅ Grounded — score='{result.score}' (attempt {current_attempts})")
-    else:
-        print(f"[hallucination_check] 🚨 Hallucination detected — score='{result.score}' (attempt {current_attempts})")
-
+    # print(result)
+    print("[generate_answer] Finished path")
     return {
-        **state,
-        "hallucination_grounded": is_grounded,
-        "hallucination_attempts": current_attempts,
+        "doc_raw_response": {"answer": result, "document_name": "Policy PDF"}, 
+        "paths_completed": ["document"]
     }
 
+def aggregator_node(state: RAGState) -> dict:
+    routes = state.get("routes", [])
+    completed = state.get("paths_completed", [])
+    
+    if not all(r in completed for r in routes):
+        print(f"[aggregator] Waiting... Completed: {completed} Needs: {routes}")
+        return {} 
+
+    print("[aggregator] ALL PATHS JOINED. Merging...")
+    sql_data = state.get("sql_raw_response")
+    doc_data = state.get("doc_raw_response")
+    
+    if sql_data and doc_data:
+        llm = _build_llm()
+        structured_llm = llm.with_structured_output(AIResponse)
+        combined = structured_llm.invoke(f"Merge these answers cohesively and provide only one final answer to display in UI and do not ignore the Citation and Page number for document related data:\n1. {sql_data['answer']}\n2. {doc_data['answer']}")
+        return {"response": {"answer": combined.model_dump()}}
+    
+    return {"response": sql_data or doc_data or {"answer": "No results found."}}
+
+def hallucination_node(state: RAGState) -> dict:
+    llm = _build_llm()
+    structured_llm = llm.with_structured_output(HallucinationGrade)
+    facts = "\n".join([d['content'] for d in state.get("reranked_docs", [])])
+    gen = state["response"].get("answer", "")
+    
+    res = structured_llm.invoke(f"Facts: {facts}\nGeneration: {gen}")
+    is_grounded = _extract_text(res.score).lower() == "yes"
+    print(f"[hallucination] Grounded: {is_grounded}")
+    return {"hallucination_grounded": is_grounded, "hallucination_attempts": 1}
+
+class HallucinationGrade(BaseModel):
+    score: str = Field(description="'yes' or 'no'")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Graph
+# Graph Construction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _route_after_validate(state: RAGState) -> str:
@@ -462,111 +287,68 @@ def _route_after_validate(state: RAGState) -> str:
         return "generate_answer"
     return "rewrite_query"
 
-
-def _route_after_hallucination_check(state: RAGState) -> str:
-    """
-    Pure router — reads `hallucination_grounded` stored by hallucination_node.
-    Mirrors LangSmith hallucination-eval routing:
-      - grounded=True  → END
-      - grounded=False → generate_answer (retry, capped at 2 hallucination_attempts)
-    """
-    is_grounded = state.get("hallucination_grounded", True)
-    ha = state.get("hallucination_attempts", 0)
-
-    if is_grounded:
-        print("[hallucination_router] ✅ Grounded → END")
-        return "end"
-    elif ha >= 2:
-        print(f"[hallucination_router] 🚨 Still hallucinating after {ha} attempt(s) — forcing END")
-        return "end"
-    else:
-        print(f"[hallucination_router] 🔁 Hallucinating → regenerating answer (attempt {ha + 1})")
-        return "generate_answer"
-
-def _route_initial_query(state: RAGState) -> str:
-    """Router decision: SQL vs RAG."""
-    if state["route"] == "product":
-        return "nl2sql"
-    return "agent"
-
 def build_rag_graph():
     graph = StateGraph(RAGState)
 
-    # --- Nodes ---
-    graph.add_node("router", nlsql_router_node)
+    graph.add_node("router", router_node)
     graph.add_node("nl2sql", nl2sql_node)
     graph.add_node("agent", agent_node)
     graph.add_node("rerank", rerank_node)
     graph.add_node("validate", validate_node)
     graph.add_node("rewrite_query", rewrite_query_node)
     graph.add_node("generate_answer", generate_answer_node)
+    graph.add_node("aggregator", aggregator_node)
     graph.add_node("hallucination_check", hallucination_node)
 
-    # --- Flow Logic ---
     graph.set_entry_point("router")
 
-    # Routing logic from the entry point
-    graph.add_conditional_edges(
-        "router",
-        _route_initial_query,
-        {
-            "nl2sql": "nl2sql",
-            "agent": "agent"
-        }
-    )
+    graph.add_conditional_edges("router", lambda state: state["routes"], {
+        "credit_card_db": "nl2sql",
+        "document": "agent"
+    })
 
-    # SQL Branch: Usually ends directly as the node generates its own structured AIResponse
-    graph.add_edge("nl2sql", END)
+    # credit_card_db Path
+    graph.add_edge("nl2sql", "aggregator")
 
-    # Document/RAG Branch
+    # Document Path with Sufficiency Loop
     graph.add_edge("agent", "rerank")
     graph.add_edge("rerank", "validate")
-
-    graph.add_conditional_edges(
-        "validate",
-        _route_after_validate,
-        {
-            "generate_answer": "generate_answer",
-            "rewrite_query": "rewrite_query",
-        },
-    )
-
+    graph.add_conditional_edges("validate", _route_after_validate, {
+        "generate_answer": "generate_answer",
+        "rewrite_query": "rewrite_query"
+    })
     graph.add_edge("rewrite_query", "agent")
-    graph.add_edge("generate_answer", "hallucination_check")
+    graph.add_edge("generate_answer", "aggregator")
 
-    graph.add_conditional_edges(
-        "hallucination_check",
-        _route_after_hallucination_check,
-        {
-            "end": END,
-            "generate_answer": "generate_answer",
-        },
+    # Convergence
+    graph.add_edge("aggregator", "hallucination_check")
+    graph.add_conditional_edges("hallucination_check", 
+        lambda state: "end" if state["hallucination_grounded"] or state["hallucination_attempts"] >= 2 else "generate_answer",
+        {"end": END, "generate_answer": "generate_answer"}
     )
 
     return graph.compile()
 
-
 rag_graph = build_rag_graph()
-graph_image = rag_graph.get_graph().draw_mermaid_png()
-with open("rag_workflow.png","wb") as f:
-    f.write(graph_image)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_rag_agent(query: str) -> dict:
-    """Run the full RAG pipeline and return the structured response dict."""
-    initial_state: RAGState = {
+    initial_state = {
         "query": query,
         "retrieved_docs": [],
         "reranked_docs": [],
         "response": {},
+        "sql_raw_response": None,
+        "doc_raw_response": None,
+        "paths_completed": [],
+        "routes": [],
         "is_valid": False,
         "attempts": 0,
         "hallucination_attempts": 0,
-        "hallucination_grounded": True,   # default; overwritten by hallucination_node
+        "hallucination_grounded": True,
     }
     final_state = rag_graph.invoke(initial_state)
     return final_state["response"]

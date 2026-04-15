@@ -27,4 +27,4 @@ async def upload_pdf(file: UploadFile = File(...)):
 def query_endpoint(request: QueryRequest):
     print(f"Received query: {request.query}")
     result = query_documents(request.query)  # Issue 17
-    return result
+    return result['answer']
