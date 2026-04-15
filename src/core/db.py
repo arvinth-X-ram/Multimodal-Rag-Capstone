@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
-
+from langchain_community.utilities import SQLDatabase
 import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
@@ -348,3 +348,18 @@ def get_all_chunks(chunk_type: str | None = None, limit: int = 200) -> list[dict
         results.append(row)
 
     return results
+
+def get_sql_database() -> SQLDatabase:
+    """Return a LangChain SQLDatabase connected to the agentic_rag_db (read-only).
+
+    Uses the rag_readonly role from sql/seed.sql — SELECT privileges only.
+    Connection string is read from AGENTIC_RAG_DB_URL in the environment.
+    """
+    db_url = os.getenv("AGENTIC_RAG_DB_URL")
+    if not db_url:
+        raise ValueError("AGENTIC_RAG_DB_URL is not set. Check your .env file.")
+    return SQLDatabase.from_uri(
+        db_url,
+        include_tables=["products", "categories", "orders", "order_items"],
+        sample_rows_in_table_info=2,
+    )
